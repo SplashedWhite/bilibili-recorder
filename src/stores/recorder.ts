@@ -138,6 +138,10 @@ export const useRecorderStore = defineStore('recorder', () => {
     }
   }
 
+  async function getRoomAvatarDataUrl(roomId: number): Promise<string> {
+    return await invoke<string>('get_room_avatar_data_url', { roomId })
+  }
+
   async function setRoomAutoRecord(roomId: number, enabled: boolean): Promise<LiveRoom> {
     const room = await invoke<LiveRoom>('set_room_auto_record', { roomId, enabled })
     upsertRoom(room)
@@ -264,7 +268,7 @@ export const useRecorderStore = defineStore('recorder', () => {
   return {
     rooms, tasks, loading, settings,
     listenRecordingEvents, stopListeningRecordingEvents,
-    loadRooms, addRoom, refreshRoom, refreshAllRooms, setRoomAutoRecord, setRoomAutoSchedule,
+    loadRooms, getRoomAvatarDataUrl, addRoom, refreshRoom, refreshAllRooms, setRoomAutoRecord, setRoomAutoSchedule,
     deleteRoom, getRoomTaskCount,
     loadTasks, startRecord, stopRecord, deleteTask, convertToMp4,
     openRecordingFile, revealRecordingFile,

@@ -906,6 +906,25 @@ fn get_rooms(state: State<AppState>) -> Result<Vec<LiveRoom>, String> {
 }
 
 #[tauri::command]
+async fn get_room_avatar_data_url(
+    state: State<'_, AppState>,
+    room_id: i64,
+) -> Result<String, String> {
+    let avatar_url = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.get_room(room_id).map_err(|e| e.to_string())?.avatar_url
+    };
+    if avatar_url.trim().is_empty() {
+        return Err("该主播没有可用头像".to_string());
+    }
+    state
+        .parser
+        .fetch_avatar_data_url(&avatar_url, &settings::load_settings())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn add_room(state: State<'_, AppState>, url: String) -> Result<LiveRoom, String> {
     let app_settings = settings::load_settings();
     let info = state
@@ -1228,6 +1247,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_rooms,
+            get_room_avatar_data_url,
             add_room,
             refresh_room,
             set_room_auto_record,

@@ -1,4 +1,7 @@
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE, REFERER, USER_AGENT};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use reqwest::header::{
+    HeaderMap, HeaderValue, ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, REFERER, USER_AGENT,
+};
 use serde_json::Value;
 use std::fmt::{Display, Formatter};
 use tokio::sync::Mutex;
@@ -7,6 +10,7 @@ use crate::settings::AppSettings;
 
 pub const BILIBILI_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const LIVE_HOST: &str = "live.bilibili.com";
+const MAX_AVATAR_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct LiveInfo {
@@ -204,6 +208,72 @@ impl BilibiliParser {
         })
     }
 
+    pub async fn fetch_avatar_data_url(
+        &self,
+        avatar_url: &str,
+        settings: &AppSettings,
+    ) -> Result<String, ParseError> {
+        let avatar_url = validate_avatar_url(avatar_url)?;
+        let client = self.client(settings).await?;
+        let response = client
+            .get(avatar_url)
+            .header(REFERER, "https://www.bilibili.com/")
+            .header(
+                ACCEPT,
+                "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            )
+            .send()
+            .await
+            .map_err(|error| ParseError::new(format!("下载主播头像失败: {}", error)))?;
+
+        if !response.status().is_success() {
+            return Err(ParseError::http(response.status()));
+        }
+        validate_avatar_url(response.url().as_str())?;
+
+        if response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|size| size > MAX_AVATAR_BYTES)
+        {
+            return Err(ParseError::new("主播头像文件过大"));
+        }
+
+        let mime_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if !matches!(
+            mime_type.as_str(),
+            "image/jpeg" | "image/png" | "image/webp" | "image/gif" | "image/avif"
+        ) {
+            return Err(ParseError::new("Bilibili 返回的头像不是受支持的图片格式"));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| ParseError::new(format!("读取主播头像失败: {}", error)))?;
+        if bytes.is_empty() {
+            return Err(ParseError::new("Bilibili 返回的主播头像为空"));
+        }
+        if bytes.len() as u64 > MAX_AVATAR_BYTES {
+            return Err(ParseError::new("主播头像文件过大"));
+        }
+
+        Ok(format!(
+            "data:{};base64,{}",
+            mime_type,
+            BASE64_STANDARD.encode(bytes)
+        ))
+    }
+
     pub async fn get_stream_selection(
         &self,
         room_id: &str,
@@ -248,6 +318,22 @@ fn build_client(settings: &AppSettings) -> Result<reqwest::Client, ParseError> {
     builder
         .build()
         .map_err(|error| ParseError::new(format!("创建 HTTP 客户端失败: {}", error)))
+}
+
+fn validate_avatar_url(value: &str) -> Result<reqwest::Url, ParseError> {
+    let mut url = reqwest::Url::parse(value).map_err(|_| ParseError::new("主播头像地址无效"))?;
+    if url.scheme() == "http" {
+        url.set_scheme("https")
+            .map_err(|_| ParseError::new("主播头像地址无效"))?;
+    }
+    let host = url.host_str().unwrap_or_default();
+    if url.scheme() != "https"
+        || !(host == "hdslb.com" || host.ends_with(".hdslb.com"))
+        || !url.path().starts_with("/bfs/face/")
+    {
+        return Err(ParseError::new("主播头像地址不属于 Bilibili 图片 CDN"));
+    }
+    Ok(url)
 }
 
 async fn resolve_input_room_id(
@@ -451,6 +537,7 @@ fn select_streams(response: &Value, requested_qn: i64) -> Result<StreamSelection
 mod tests {
     use super::{
         extract_numeric_path_segment, is_real_live_status, normalize_quality, select_streams,
+        validate_avatar_url,
     };
     use serde_json::json;
 
@@ -472,6 +559,17 @@ mod tests {
     fn quality_uses_known_qn_values_only() {
         assert_eq!(normalize_quality("400"), 400);
         assert_eq!(normalize_quality("invalid"), 10000);
+    }
+
+    #[test]
+    fn avatar_proxy_accepts_only_bilibili_face_images() {
+        let upgraded = validate_avatar_url(
+            "http://i0.hdslb.com/bfs/face/360aa261103416e5e05524f2e5d521d422248e70.jpg",
+        )
+        .unwrap();
+        assert_eq!(upgraded.scheme(), "https");
+        assert!(validate_avatar_url("https://example.com/bfs/face/avatar.jpg").is_err());
+        assert!(validate_avatar_url("https://i0.hdslb.com/bfs/live/cover.jpg").is_err());
     }
 
     #[test]

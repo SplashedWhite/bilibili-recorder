@@ -54,11 +54,12 @@
           <!-- Avatar -->
           <div class="room-avatar" :class="{ live: room.is_live }">
             <img
-              v-if="room.avatar_url"
-              :src="room.avatar_url"
+              v-if="getAvatarSource(room)"
+              :src="getAvatarSource(room)"
               :alt="room.anchor_name"
               class="avatar-img"
-              @error="($event.target as HTMLImageElement).style.display = 'none'"
+              referrerpolicy="no-referrer"
+              @error="handleAvatarError(room)"
             />
             <span v-else class="avatar-fallback">{{ getInitial(room.anchor_name) }}</span>
             <span v-if="room.is_live" class="live-dot"></span>
@@ -192,6 +193,13 @@ const scheduleRoom = ref<LiveRoom | null>(null)
 const scheduleTime = ref<string | null>(null)
 const scheduleSaving = ref(false)
 const displayNow = ref(Date.now())
+interface AvatarState {
+  originalUrl: string
+  source: string
+  loading: boolean
+  proxied: boolean
+}
+const avatarStates = ref<Record<number, AvatarState>>({})
 let displayTimer: number | undefined
 
 onMounted(() => {
@@ -206,6 +214,53 @@ onBeforeUnmount(() => {
 
 function getInitial(name: string) {
   return (name || '?').charAt(0).toUpperCase()
+}
+
+function getAvatarSource(room: LiveRoom) {
+  const state = avatarStates.value[room.id]
+  return state?.originalUrl === room.avatar_url ? state.source : room.avatar_url
+}
+
+async function handleAvatarError(room: LiveRoom) {
+  const originalUrl = room.avatar_url
+  if (!originalUrl) return
+
+  const current = avatarStates.value[room.id]
+  if (current?.originalUrl === originalUrl && (current.loading || current.proxied)) {
+    avatarStates.value[room.id] = {
+      originalUrl,
+      source: '',
+      loading: false,
+      proxied: true,
+    }
+    return
+  }
+
+  avatarStates.value[room.id] = {
+    originalUrl,
+    source: '',
+    loading: true,
+    proxied: false,
+  }
+  try {
+    const source = await store.getRoomAvatarDataUrl(room.id)
+    const latestRoom = rooms.value.find(item => item.id === room.id)
+    if (latestRoom?.avatar_url !== originalUrl) return
+    avatarStates.value[room.id] = {
+      originalUrl,
+      source,
+      loading: false,
+      proxied: true,
+    }
+  } catch (error) {
+    console.warn(`加载主播头像失败（房间 ${room.room_id}）:`, error)
+    avatarStates.value[room.id] = {
+      originalUrl,
+      source: '',
+      loading: false,
+      proxied: true,
+    }
+  }
 }
 
 function getActiveTask(roomId: number) {
