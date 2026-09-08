@@ -35,7 +35,17 @@ pub struct StreamSelection {
     pub requested_qn: i64,
     pub actual_qn: i64,
     pub stream_type: String,
+    pub output_extension: String,
+    pub output_format: String,
     pub candidates: Vec<StreamCandidate>,
+}
+
+struct StreamVariant {
+    actual_qn: i64,
+    protocol_name: String,
+    format_name: String,
+    codec_name: String,
+    candidates: Vec<StreamCandidate>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,9 +291,10 @@ impl BilibiliParser {
     ) -> Result<StreamSelection, ParseError> {
         let client = self.client(settings).await?;
         let requested_qn = normalize_quality(&settings.quality);
+        let codec_query = codec_query(&settings.codec_preference);
         let play_url = format!(
-            "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id={}&protocol=0,1&format=0,1,2&codec=0&qn={}&platform=web&ptype=8",
-            room_id, requested_qn
+            "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id={}&protocol=0,1&format=0,1,2&codec={}&qn={}&platform=web&ptype=8",
+            room_id, codec_query, requested_qn
         );
         let response = request_json(
             &client,
@@ -300,7 +311,7 @@ impl BilibiliParser {
         {
             return Err(ParseError::new("主播未开播"));
         }
-        select_streams(&response, requested_qn)
+        select_streams(&response, requested_qn, &settings.codec_preference)
     }
 }
 
@@ -454,90 +465,237 @@ fn normalize_quality(quality: &str) -> i64 {
     }
 }
 
+fn normalize_codec_preference(codec_preference: &str) -> &str {
+    match codec_preference {
+        "avc" | "hevc" | "av1" => codec_preference,
+        _ => "auto",
+    }
+}
+
+fn codec_query(codec_preference: &str) -> &'static str {
+    match normalize_codec_preference(codec_preference) {
+        "avc" => "0",
+        "hevc" => "1",
+        "av1" => "2",
+        _ => "0,1,2",
+    }
+}
+
 fn is_real_live_status(status: Option<i64>) -> bool {
     status == Some(1)
 }
 
-fn select_streams(response: &Value, requested_qn: i64) -> Result<StreamSelection, ParseError> {
+fn select_streams(
+    response: &Value,
+    requested_qn: i64,
+    codec_preference: &str,
+) -> Result<StreamSelection, ParseError> {
     let streams = response
         .pointer("/data/playurl_info/playurl/stream")
         .and_then(Value::as_array)
         .ok_or_else(|| ParseError::new("Bilibili 未返回可用直播流"))?;
-    let priorities = [("http_stream", "flv", "FLV"), ("http_hls", "ts", "HLS-TS")];
+    let codec_preference = normalize_codec_preference(codec_preference);
+    let mut variants = Vec::new();
 
-    for (protocol_name, format_name, stream_type) in priorities {
-        let mut candidates = Vec::new();
-        let mut actual_qn = 0;
-        for stream in streams {
-            if stream.get("protocol_name").and_then(Value::as_str) != Some(protocol_name) {
+    for stream in streams {
+        let protocol_name = stream
+            .get("protocol_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for format in stream
+            .get("format")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let format_name = format
+                .get("format_name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !is_supported_transport(protocol_name, format_name) {
                 continue;
             }
-            for format in stream
-                .get("format")
+            for codec in format
+                .get("codec")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
             {
-                if format.get("format_name").and_then(Value::as_str) != Some(format_name) {
+                let codec_name = codec
+                    .get("codec_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !matches!(codec_name, "avc" | "hevc" | "av1")
+                    || (codec_preference != "auto" && codec_name != codec_preference)
+                {
                     continue;
                 }
-                for codec in format
-                    .get("codec")
+                let base_url = codec
+                    .get("base_url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let mut candidates = Vec::new();
+                for url_info in codec
+                    .get("url_info")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
                 {
-                    if codec.get("codec_name").and_then(Value::as_str) != Some("avc") {
-                        continue;
-                    }
-                    actual_qn = codec
-                        .get("current_qn")
-                        .and_then(Value::as_i64)
-                        .unwrap_or(requested_qn);
-                    let base_url = codec
-                        .get("base_url")
+                    let host = url_info
+                        .get("host")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    for url_info in codec
-                        .get("url_info")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                    {
-                        let host = url_info
-                            .get("host")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let extra = url_info
-                            .get("extra")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        if !host.is_empty() && !base_url.is_empty() {
-                            candidates.push(StreamCandidate {
-                                url: format!("{}{}{}", host, base_url, extra),
-                            });
-                        }
+                    let extra = url_info
+                        .get("extra")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !host.is_empty() && !base_url.is_empty() {
+                        candidates.push(StreamCandidate {
+                            url: format!("{}{}{}", host, base_url, extra),
+                        });
                     }
+                }
+                if !candidates.is_empty() {
+                    variants.push(StreamVariant {
+                        actual_qn: codec
+                            .get("current_qn")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(requested_qn),
+                        protocol_name: protocol_name.to_string(),
+                        format_name: format_name.to_string(),
+                        codec_name: codec_name.to_string(),
+                        candidates,
+                    });
                 }
             }
         }
-        if !candidates.is_empty() {
-            return Ok(StreamSelection {
-                requested_qn,
-                actual_qn,
-                stream_type: stream_type.to_string(),
-                candidates,
-            });
+    }
+
+    variants.sort_by_key(|variant| {
+        let quality = quality_priority(variant.actual_qn, requested_qn);
+        let codec = codec_priority(&variant.codec_name, codec_preference);
+        let transport = transport_priority(
+            &variant.protocol_name,
+            &variant.format_name,
+            &variant.codec_name,
+        );
+        (quality.0, quality.1, codec, transport)
+    });
+
+    let selected = variants.into_iter().next().ok_or_else(|| {
+        let suffix = match codec_preference {
+            "avc" => "AVC",
+            "hevc" => "HEVC",
+            "av1" => "AV1",
+            _ => "受支持的",
+        };
+        ParseError::new(format!("未找到{}编码直播流", suffix))
+    })?;
+    let use_flv = selected.codec_name == "avc"
+        && selected.protocol_name == "http_stream"
+        && selected.format_name == "flv";
+    let (output_extension, output_format, output_label) = if use_flv {
+        ("flv", "flv", "FLV")
+    } else {
+        ("mkv", "matroska", "MKV")
+    };
+    Ok(StreamSelection {
+        requested_qn,
+        actual_qn: selected.actual_qn,
+        stream_type: format!(
+            "{} · {} → {}",
+            transport_label(&selected.protocol_name, &selected.format_name),
+            codec_label(&selected.codec_name),
+            output_label
+        ),
+        output_extension: output_extension.to_string(),
+        output_format: output_format.to_string(),
+        candidates: selected.candidates,
+    })
+}
+
+fn is_supported_transport(protocol_name: &str, format_name: &str) -> bool {
+    matches!(
+        (protocol_name, format_name),
+        ("http_stream", "flv") | ("http_hls", "ts") | ("http_hls", "fmp4")
+    )
+}
+
+fn quality_rank(qn: i64) -> Option<i64> {
+    match qn {
+        80 => Some(0),
+        150 => Some(1),
+        250 => Some(2),
+        400 => Some(3),
+        10000 => Some(4),
+        _ => None,
+    }
+}
+
+fn quality_priority(actual_qn: i64, requested_qn: i64) -> (u8, u64) {
+    if actual_qn == requested_qn {
+        return (0, 0);
+    }
+    match (quality_rank(actual_qn), quality_rank(requested_qn)) {
+        (Some(actual), Some(requested)) if actual < requested => (1, (requested - actual) as u64),
+        (Some(actual), Some(requested)) => (2, (actual - requested) as u64),
+        _ => (3, actual_qn.abs_diff(requested_qn)),
+    }
+}
+
+fn codec_priority(codec_name: &str, codec_preference: &str) -> u8 {
+    if codec_preference != "auto" {
+        return 0;
+    }
+    match codec_name {
+        "avc" => 0,
+        "hevc" => 1,
+        "av1" => 2,
+        _ => 3,
+    }
+}
+
+fn transport_priority(protocol_name: &str, format_name: &str, codec_name: &str) -> u8 {
+    if codec_name == "avc" {
+        match (protocol_name, format_name) {
+            ("http_stream", "flv") => 0,
+            ("http_hls", "ts") => 1,
+            ("http_hls", "fmp4") => 2,
+            _ => 3,
+        }
+    } else {
+        match (protocol_name, format_name) {
+            ("http_hls", "fmp4") => 0,
+            ("http_hls", "ts") => 1,
+            ("http_stream", "flv") => 2,
+            _ => 3,
         }
     }
-    Err(ParseError::new("未找到兼容的 AVC 直播流"))
+}
+
+fn transport_label(protocol_name: &str, format_name: &str) -> &'static str {
+    match (protocol_name, format_name) {
+        ("http_stream", "flv") => "FLV",
+        ("http_hls", "ts") => "HLS-TS",
+        ("http_hls", "fmp4") => "HLS-fMP4",
+        _ => "直播流",
+    }
+}
+
+fn codec_label(codec_name: &str) -> &'static str {
+    match codec_name {
+        "avc" => "AVC",
+        "hevc" => "HEVC",
+        "av1" => "AV1",
+        _ => "未知编码",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_numeric_path_segment, is_real_live_status, normalize_quality, select_streams,
-        validate_avatar_url,
+        codec_query, extract_numeric_path_segment, is_real_live_status, normalize_quality,
+        select_streams, validate_avatar_url,
     };
     use serde_json::json;
 
@@ -559,6 +717,10 @@ mod tests {
     fn quality_uses_known_qn_values_only() {
         assert_eq!(normalize_quality("400"), 400);
         assert_eq!(normalize_quality("invalid"), 10000);
+        assert_eq!(codec_query("auto"), "0,1,2");
+        assert_eq!(codec_query("avc"), "0");
+        assert_eq!(codec_query("hevc"), "1");
+        assert_eq!(codec_query("av1"), "2");
     }
 
     #[test]
@@ -587,9 +749,11 @@ mod tests {
                 }]}]
             }]}}}
         });
-        let selected = select_streams(&response, 10000).unwrap();
+        let selected = select_streams(&response, 10000, "auto").unwrap();
         assert_eq!(selected.actual_qn, 250);
-        assert_eq!(selected.stream_type, "FLV");
+        assert_eq!(selected.stream_type, "FLV · AVC → FLV");
+        assert_eq!(selected.output_extension, "flv");
+        assert_eq!(selected.output_format, "flv");
         assert_eq!(selected.candidates.len(), 2);
         assert!(selected.candidates[0]
             .url
@@ -597,9 +761,70 @@ mod tests {
     }
 
     #[test]
+    fn automatic_codec_selection_prefers_actual_quality_before_compatibility() {
+        let response = json!({
+            "data": {"playurl_info": {"playurl": {"stream": [
+                {
+                    "protocol_name": "http_stream",
+                    "format": [{"format_name": "flv", "codec": [{
+                        "codec_name": "avc", "current_qn": 250,
+                        "base_url": "/live.flv?",
+                        "url_info": [{"host": "https://avc.example", "extra": "token=a"}]
+                    }]}]
+                },
+                {
+                    "protocol_name": "http_hls",
+                    "format": [{"format_name": "fmp4", "codec": [{
+                        "codec_name": "av1", "current_qn": 400,
+                        "base_url": "/live/index.m3u8?",
+                        "url_info": [{"host": "https://av1.example", "extra": "token=b"}]
+                    }]}]
+                }
+            ]}}}
+        });
+
+        let automatic = select_streams(&response, 400, "auto").unwrap();
+        assert_eq!(automatic.actual_qn, 400);
+        assert_eq!(automatic.stream_type, "HLS-fMP4 · AV1 → MKV");
+        assert_eq!(automatic.output_extension, "mkv");
+        assert_eq!(automatic.output_format, "matroska");
+
+        let forced_avc = select_streams(&response, 400, "avc").unwrap();
+        assert_eq!(forced_avc.actual_qn, 250);
+        assert_eq!(forced_avc.stream_type, "FLV · AVC → FLV");
+    }
+
+    #[test]
+    fn automatic_codec_selection_prefers_avc_when_quality_is_equal() {
+        let response = json!({
+            "data": {"playurl_info": {"playurl": {"stream": [
+                {
+                    "protocol_name": "http_stream",
+                    "format": [{"format_name": "flv", "codec": [{
+                        "codec_name": "avc", "current_qn": 400,
+                        "base_url": "/live.flv?",
+                        "url_info": [{"host": "https://avc.example", "extra": "token=a"}]
+                    }]}]
+                },
+                {
+                    "protocol_name": "http_hls",
+                    "format": [{"format_name": "fmp4", "codec": [{
+                        "codec_name": "av1", "current_qn": 400,
+                        "base_url": "/live/index.m3u8?",
+                        "url_info": [{"host": "https://av1.example", "extra": "token=b"}]
+                    }]}]
+                }
+            ]}}}
+        });
+
+        let selected = select_streams(&response, 400, "auto").unwrap();
+        assert_eq!(selected.stream_type, "FLV · AVC → FLV");
+    }
+
+    #[test]
     fn missing_playurl_is_not_recordable() {
         let response = json!({"data": {"live_status": 2, "playurl_info": null}});
-        assert!(select_streams(&response, 10000).is_err());
+        assert!(select_streams(&response, 10000, "auto").is_err());
     }
 
     #[test]

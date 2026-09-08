@@ -242,8 +242,10 @@ async function openFolder(task: RecordTask) {
   }
 }
 
-function isFlvFile(task: RecordTask): boolean {
-  return !!task.file_path && task.file_path.toLowerCase().endsWith('.flv')
+function canRemuxFile(task: RecordTask): boolean {
+  if (!task.file_path) return false
+  const path = task.file_path.toLowerCase()
+  return path.endsWith('.flv') || path.endsWith('.mkv')
 }
 
 function canAccessFile(task: RecordTask): boolean {
@@ -251,7 +253,7 @@ function canAccessFile(task: RecordTask): boolean {
 }
 
 function canConvert(task: RecordTask): boolean {
-  return canAccessFile(task) && isFlvFile(task)
+  return canAccessFile(task) && canRemuxFile(task)
 }
 
 async function convertToMp4(task: RecordTask) {

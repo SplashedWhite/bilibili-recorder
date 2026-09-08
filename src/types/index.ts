@@ -34,6 +34,7 @@ export interface AppSettings {
   proxy: string
   cookie: string
   quality: string
+  codec_preference: string
   recordings_dir: string
   db_path: string
   auto_convert_mp4: boolean

@@ -303,16 +303,25 @@ async fn refresh_room_internal(state: &AppState, room_id: i64) -> Result<LiveRoo
     apply_live_info(state, room_id, &info)
 }
 
-fn remux_flv_to_mp4(
+fn can_remux_recording_to_mp4(file_path: &str) -> bool {
+    std::path::Path::new(file_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("flv") || extension.eq_ignore_ascii_case("mkv")
+        })
+}
+
+fn remux_recording_to_mp4(
     file_path: &str,
     preserve_source: bool,
 ) -> Result<(String, i64, Option<String>), String> {
-    if !file_path.ends_with(".flv") {
-        return Err("文件不是 FLV 格式，无需转换".to_string());
+    if !can_remux_recording_to_mp4(file_path) {
+        return Err("仅支持将 FLV 或 MKV 录制无损封装为 MP4".to_string());
     }
     let source = std::path::Path::new(file_path);
     if !source.exists() {
-        return Err("原始 FLV 文件不存在".to_string());
+        return Err("原始录制文件不存在".to_string());
     }
     let parent = source
         .parent()
@@ -363,7 +372,7 @@ fn remux_flv_to_mp4(
     let warning = if !preserve_source {
         std::fs::remove_file(file_path)
             .err()
-            .map(|error| format!("MP4 已生成，但原始 FLV 未能删除: {}", error))
+            .map(|error| format!("MP4 已生成，但原始录制文件未能删除: {}", error))
     } else {
         None
     };
@@ -500,11 +509,13 @@ async fn handle_recording_exit(
         && conversion_settings.auto_convert_mp4
         && final_path
             .as_deref()
-            .is_some_and(|path| path.ends_with(".flv"))
+            .is_some_and(can_remux_recording_to_mp4)
     {
         let path = final_path.clone().unwrap_or_default();
         let preserve_source = conversion_settings.preserve_source_after_convert;
-        match tokio::task::spawn_blocking(move || remux_flv_to_mp4(&path, preserve_source)).await {
+        match tokio::task::spawn_blocking(move || remux_recording_to_mp4(&path, preserve_source))
+            .await
+        {
             Ok(Ok((mp4_path, mp4_size, warning))) => {
                 final_path = Some(mp4_path);
                 final_size = mp4_size;
@@ -518,14 +529,14 @@ async fn handle_recording_exit(
             }
             Ok(Err(error)) => {
                 message = Some(format!(
-                    "{}；自动转换 MP4 失败，已保留 FLV: {}",
+                    "{}；自动转换 MP4 失败，已保留原始录制文件: {}",
                     message.unwrap_or_else(|| "录制已完成".to_string()),
                     error
                 ));
             }
             Err(error) => {
                 message = Some(format!(
-                    "{}；自动转换任务异常，已保留 FLV: {}",
+                    "{}；自动转换任务异常，已保留原始录制文件: {}",
                     message.unwrap_or_else(|| "录制已完成".to_string()),
                     error
                 ));
@@ -601,7 +612,7 @@ async fn start_record_from_info(
             timestamp
         );
         let recordings_dir = get_recordings_dir()?;
-        let output_path = unique_output_path(&recordings_dir, &stem, "flv");
+        let output_path = unique_output_path(&recordings_dir, &stem, &selection.output_extension);
         let output_str = output_path.to_string_lossy().to_string();
         db.update_task_status_and_path(task_id, "preparing", Some(&output_str))
             .map_err(|e| e.to_string())?;
@@ -616,6 +627,7 @@ async fn start_record_from_info(
             task_id,
             &selection.candidates,
             &output_str,
+            &selection.output_format,
             &app_settings.proxy,
             &app_settings.cookie,
             &info.room_id,
@@ -1164,7 +1176,7 @@ fn convert_to_mp4(state: State<AppState>, task_id: i64) -> Result<String, String
         .as_deref()
         .ok_or_else(|| "文件路径为空".to_string())?;
     let preserve_source = settings::load_settings().preserve_source_after_convert;
-    let (mp4_path, size, _warning) = remux_flv_to_mp4(file_path, preserve_source)?;
+    let (mp4_path, size, _warning) = remux_recording_to_mp4(file_path, preserve_source)?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.finish_task(task_id, &task.status, Some(&mp4_path), size)
         .map_err(|e| e.to_string())?;
@@ -1273,7 +1285,7 @@ pub fn run() {
 mod tests {
     use super::{
         auto_post_record_action, classify_recording, daily_schedule_is_due,
-        initial_schedule_marker, remux_flv_to_mp4, resolve_ffmpeg_path,
+        initial_schedule_marker, remux_recording_to_mp4, resolve_ffmpeg_path,
         sanitize_filename_component, should_poll_auto_room, AutoPostRecordAction, LiveVerification,
     };
     use crate::database::LiveRoom;
@@ -1390,7 +1402,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn mp4_remux_respects_source_retention_setting() {
+    fn mp4_remux_supports_flv_and_av1_mkv_with_source_retention() {
         use std::os::windows::process::CommandExt;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1409,11 +1421,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        for preserve in [true, false] {
-            let source = temp_dir.join(format!("source-{}.flv", preserve));
-            let mut generator = std::process::Command::new(&ffmpeg);
-            generator
-                .args([
+        for (extension, codec, container) in
+            [("flv", "libx264", "flv"), ("mkv", "libaom-av1", "matroska")]
+        {
+            for preserve in [true, false] {
+                let source =
+                    temp_dir.join(format!("source-{}-{}.{}", extension, preserve, extension));
+                let mut generator = std::process::Command::new(&ffmpeg);
+                generator.args([
                     "-y",
                     "-hide_banner",
                     "-loglevel",
@@ -1425,22 +1440,26 @@ mod tests {
                     "-t",
                     "1",
                     "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                    "-f",
-                    "flv",
-                ])
-                .arg(&source)
-                .creation_flags(0x08000000);
-            assert!(generator.status().unwrap().success());
+                    codec,
+                ]);
+                if codec == "libx264" {
+                    generator.args(["-preset", "ultrafast"]);
+                } else {
+                    generator.args(["-cpu-used", "8", "-crf", "50"]);
+                }
+                generator
+                    .args(["-f", container])
+                    .arg(&source)
+                    .creation_flags(0x08000000);
+                assert!(generator.status().unwrap().success());
 
-            let (mp4, size, warning) =
-                remux_flv_to_mp4(source.to_str().unwrap(), preserve).unwrap();
-            assert!(size > 0);
-            assert!(warning.is_none());
-            assert!(std::path::Path::new(&mp4).exists());
-            assert_eq!(source.exists(), preserve);
+                let (mp4, size, warning) =
+                    remux_recording_to_mp4(source.to_str().unwrap(), preserve).unwrap();
+                assert!(size > 0);
+                assert!(warning.is_none());
+                assert!(std::path::Path::new(&mp4).exists());
+                assert_eq!(source.exists(), preserve);
+            }
         }
         let _ = std::fs::remove_dir_all(temp_dir);
     }

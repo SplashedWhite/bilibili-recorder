@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, watch};
 
@@ -15,6 +15,8 @@ use std::os::windows::process::CommandExt;
 
 const STDERR_TAIL_LINES: usize = 50;
 const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(20);
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -56,6 +58,7 @@ impl Recorder {
         task_id: i64,
         candidates: &[StreamCandidate],
         output_path: &str,
+        output_format: &str,
         proxy: &str,
         cookie: &str,
         room_id: &str,
@@ -71,6 +74,9 @@ impl Recorder {
         if self.is_active(task_id) {
             return Err("该录制任务已经在运行".to_string());
         }
+        if !matches!(output_format, "flv" | "matroska") {
+            return Err("不支持的录制输出格式".to_string());
+        }
         if let Some(parent) = std::path::Path::new(output_path).parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建输出目录失败: {}", e))?;
         }
@@ -80,8 +86,14 @@ impl Recorder {
             if std::path::Path::new(output_path).exists() {
                 let _ = std::fs::remove_file(output_path);
             }
-            let (mut child, stderr_tail, stderr_task) =
-                self.spawn_ffmpeg(&candidate.url, output_path, proxy, cookie, room_id)?;
+            let (mut child, stderr_tail, stderr_task) = self.spawn_ffmpeg(
+                &candidate.url,
+                output_path,
+                output_format,
+                proxy,
+                cookie,
+                room_id,
+            )?;
 
             match wait_until_ready(&mut child, output_path).await {
                 Ok(()) => {
@@ -100,19 +112,8 @@ impl Recorder {
 
                     let active_records = Arc::clone(&self.active_records);
                     tokio::spawn(async move {
-                        let (manually_stopped, status_success, wait_error) = tokio::select! {
-                            result = child.wait() => match result {
-                                Ok(status) => (false, status.success(), None),
-                                Err(error) => (false, false, Some(error.to_string())),
-                            },
-                            _ = &mut stop_rx => {
-                                let kill_error = child.start_kill().err().map(|error| error.to_string());
-                                match child.wait().await {
-                                    Ok(status) => (true, status.success(), kill_error),
-                                    Err(error) => (true, false, Some(error.to_string())),
-                                }
-                            }
-                        };
+                        let (manually_stopped, status_success, wait_error) =
+                            wait_for_recording_exit(&mut child, &mut stop_rx).await;
                         if let Some(stderr_task) = stderr_task {
                             let _ = stderr_task.await;
                         }
@@ -161,12 +162,13 @@ impl Recorder {
         &self,
         stream_url: &str,
         output_path: &str,
+        output_format: &str,
         proxy: &str,
         cookie: &str,
         room_id: &str,
     ) -> Result<SpawnedFfmpeg, String> {
         let mut cmd = Command::new(&self.ffmpeg_path);
-        cmd.args(["-y", "-nostdin", "-loglevel", "warning", "-nostats"]);
+        cmd.args(["-y", "-loglevel", "warning", "-nostats"]);
         if stream_url.starts_with("http://") || stream_url.starts_with("https://") {
             let mut headers = format!(
                 "Referer: https://live.bilibili.com/{}\r\nUser-Agent: {}\r\n",
@@ -190,10 +192,19 @@ impl Recorder {
                 &headers,
             ]);
         }
-        cmd.args(["-i", stream_url, "-c", "copy", "-f", "flv", output_path])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        cmd.args([
+            "-i",
+            stream_url,
+            "-c",
+            "copy",
+            "-f",
+            output_format,
+            output_path,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
         #[cfg(windows)]
         cmd.as_std_mut().creation_flags(0x08000000);
         if !proxy.trim().is_empty() {
@@ -261,6 +272,56 @@ impl Recorder {
     }
 }
 
+async fn stop_ffmpeg_gracefully(child: &mut Child) -> (bool, Option<String>) {
+    let signal_error = match child.stdin.take() {
+        Some(mut stdin) => async {
+            stdin.write_all(b"q").await?;
+            stdin.flush().await?;
+            stdin.shutdown().await
+        }
+        .await
+        .err()
+        .map(|error| format!("发送停止指令失败: {}", error)),
+        None => Some("无法向 FFmpeg 发送停止指令".to_string()),
+    };
+    match tokio::time::timeout(GRACEFUL_STOP_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => (status.success(), signal_error),
+        Ok(Err(error)) => (false, Some(format!("等待 FFmpeg 停止失败: {}", error))),
+        Err(_) => {
+            let kill_error = child.start_kill().err().map(|error| error.to_string());
+            let wait_error = child.wait().await.err().map(|error| error.to_string());
+            let detail = kill_error.or(wait_error).unwrap_or_else(|| {
+                format!(
+                    "FFmpeg 未在 {} 秒内正常停止，已强制结束",
+                    GRACEFUL_STOP_TIMEOUT.as_secs()
+                )
+            });
+            (false, Some(detail))
+        }
+    }
+}
+
+async fn wait_for_recording_exit(
+    child: &mut Child,
+    stop_rx: &mut oneshot::Receiver<()>,
+) -> (bool, bool, Option<String>) {
+    loop {
+        tokio::select! {
+            _ = &mut *stop_rx => {
+                let (status_success, wait_error) = stop_ffmpeg_gracefully(child).await;
+                return (true, status_success, wait_error);
+            }
+            _ = tokio::time::sleep(EXIT_POLL_INTERVAL) => {
+                match child.try_wait() {
+                    Ok(Some(status)) => return (false, status.success(), None),
+                    Ok(None) => {}
+                    Err(error) => return (false, false, Some(error.to_string())),
+                }
+            }
+        }
+    }
+}
+
 async fn wait_until_ready(child: &mut Child, output_path: &str) -> Result<(), String> {
     let started_at = tokio::time::Instant::now();
     loop {
@@ -309,11 +370,43 @@ impl Drop for Recorder {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::Recorder;
+    use super::{wait_for_recording_exit, Recorder};
     use crate::parser::StreamCandidate;
     use std::os::windows::process::CommandExt;
-    use std::process::Command as StdCommand;
+    use std::process::{Command as StdCommand, Stdio};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn keeps_child_stdin_open_until_a_stop_is_requested() {
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$value = [Console]::In.ReadToEnd(); if ($value -eq 'q') { exit 0 }; exit 1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        command.as_std_mut().creation_flags(0x08000000);
+        let mut child = command.spawn().unwrap();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        stop_tx.send(()).unwrap();
+
+        let (manually_stopped, status_success, wait_error) = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_recording_exit(&mut child, &mut stop_rx),
+        )
+        .await
+        .unwrap();
+
+        assert!(manually_stopped);
+        assert!(status_success);
+        assert!(wait_error.is_none());
+    }
 
     #[tokio::test]
     async fn observes_natural_ffmpeg_exit_and_removes_active_record() {
@@ -366,6 +459,7 @@ mod tests {
                     url: input_path.to_string_lossy().to_string(),
                 }],
                 output_path.to_str().unwrap(),
+                "flv",
                 "",
                 "",
                 "42",

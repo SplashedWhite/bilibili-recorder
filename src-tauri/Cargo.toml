@@ -1,6 +1,6 @@
 [package]
 name = "bilibili-recorder"
-version = "0.1.1"
+version = "0.1.2"
 description = "A lightweight Bilibili live stream recorder"
 authors = ["zxy83"]
 edition = "2021"

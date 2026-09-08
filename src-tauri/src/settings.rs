@@ -7,6 +7,7 @@ pub struct AppSettings {
     pub proxy: String,
     pub cookie: String,
     pub quality: String,
+    pub codec_preference: String,
     pub recordings_dir: String,
     pub db_path: String,
     pub auto_convert_mp4: bool,
@@ -36,6 +37,7 @@ impl Default for AppSettings {
             proxy: String::new(),
             cookie: String::new(),
             quality: "10000".to_string(),
+            codec_preference: "auto".to_string(),
             recordings_dir: default_recordings,
             db_path: String::new(),
             auto_convert_mp4: false,
@@ -87,6 +89,12 @@ pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
         "10000" | "400" | "250" | "150" | "80"
     ) {
         return Err("画质设置无效".to_string());
+    }
+    if !matches!(
+        settings.codec_preference.as_str(),
+        "auto" | "avc" | "hevc" | "av1"
+    ) {
+        return Err("视频编码设置无效".to_string());
     }
     if !(10..=3600).contains(&settings.auto_check_interval_secs) {
         return Err("自动录制检测间隔必须在 10 到 3600 秒之间".to_string());
@@ -154,6 +162,7 @@ mod tests {
 
         assert_eq!(settings.auto_check_interval_secs, 60);
         assert_eq!(settings.auto_monitor_window_hours, 6);
+        assert_eq!(settings.codec_preference, "auto");
         assert!(settings.auto_disable_after_record);
         assert!(settings.preserve_source_after_convert);
     }

@@ -32,7 +32,7 @@
       <div class="settings-section">
         <div class="section-header">
           <span class="section-label">画质偏好</span>
-          <span class="section-hint">不可用时自动降级</span>
+          <span class="section-hint">不可用时选择官方返回的最接近画质</span>
         </div>
         <el-select v-model="form.quality" size="large" style="width: 100%">
           <el-option label="原画 (QN 10000)" value="10000" />
@@ -40,6 +40,19 @@
           <el-option label="超清 720P (QN 250)" value="250" />
           <el-option label="高清 480P (QN 150)" value="150" />
           <el-option label="流畅 (QN 80)" value="80" />
+        </el-select>
+      </div>
+
+      <div class="settings-section">
+        <div class="section-header">
+          <span class="section-label">视频编码</span>
+          <span class="section-hint">自动模式优先实际画质</span>
+        </div>
+        <el-select v-model="form.codec_preference" size="large" style="width: 100%">
+          <el-option label="自动选择（推荐）" value="auto" />
+          <el-option label="AVC / H.264（兼容性最好）" value="avc" />
+          <el-option label="HEVC / H.265" value="hevc" />
+          <el-option label="AV1" value="av1" />
         </el-select>
       </div>
 
@@ -113,7 +126,7 @@
       <div class="settings-section">
         <div class="section-header">
           <span class="section-label">自动转换 MP4</span>
-          <span class="section-hint">录制完成后自动将 FLV 转为 MP4 格式</span>
+          <span class="section-hint">录制完成后自动将 FLV/MKV 封装为 MP4</span>
         </div>
         <el-switch
           v-model="form.auto_convert_mp4"
@@ -122,7 +135,7 @@
         />
         <div class="preserve-source-row">
           <div>
-            <div class="auto-setting-label">保留原始 FLV</div>
+            <div class="auto-setting-label">保留原始录制文件</div>
             <div class="auto-setting-hint">关闭后仅在 MP4 转换成功时删除源文件</div>
           </div>
           <el-switch v-model="form.preserve_source_after_convert" />
@@ -198,6 +211,7 @@ const form = reactive({
   proxy: '',
   cookie: '',
   quality: '10000',
+  codec_preference: 'auto',
   recordings_dir: '',
   db_path: '',
   auto_convert_mp4: false,
@@ -213,6 +227,7 @@ function onOpen() {
   form.proxy = store.settings.proxy
   form.cookie = store.settings.cookie
   form.quality = store.settings.quality || '10000'
+  form.codec_preference = store.settings.codec_preference || 'auto'
   form.recordings_dir = store.settings.recordings_dir || ''
   form.db_path = store.settings.db_path || ''
   form.auto_convert_mp4 = store.settings.auto_convert_mp4 ?? false

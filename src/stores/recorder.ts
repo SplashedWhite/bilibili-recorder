@@ -19,6 +19,7 @@ export const useRecorderStore = defineStore('recorder', () => {
     proxy: '',
     cookie: '',
     quality: '10000',
+    codec_preference: 'auto',
     recordings_dir: '',
     db_path: '',
     auto_convert_mp4: false,
